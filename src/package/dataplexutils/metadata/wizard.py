@@ -48,6 +48,7 @@ import vertexai.preview.generative_models as generative_models
 
 import random
 from google.cloud import storage
+from .dbt_reader import DBTReader
 
 # Load constants
 constants = toml.loads(pkgutil.get_data(__name__, "constants.toml").decode())
@@ -64,9 +65,10 @@ class PromtType(Enum):
 class PromptManager:
     """Represents a prompt manager."""
 
-    def __init__(self, prompt_type, client_options):
+    def __init__(self, prompt_type, client_options, context=None):
         self._prompt_type = prompt_type
         self._client_options = client_options
+        self._context = context
 
     def get_promtp(self):
         try:
@@ -83,57 +85,42 @@ class PromptManager:
     def _get_prompt_table(self):
         try:
             # System
-            table_description_prompt = constants["PROMPTS"]["SYSTEM_PROMPT"]
+            prompt = constants["PROMPTS"]["SYSTEM_PROMPT"]
             # Base
-            table_description_prompt = (
-                table_description_prompt
-                + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_BASE"]
-            )
-            # Additional metadata information
-            if self._client_options._use_profile:
-                table_description_prompt = (
-                    table_description_prompt
-                    + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_PROFILE"]
-                )
-            if self._client_options._use_data_quality:
-                table_description_prompt = (
-                    table_description_prompt
-                    + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_QUALITY"]
-                )
-            if self._client_options._use_lineage_tables:
-                table_description_prompt = (
-                    table_description_prompt
-                    + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_LINEAGE_TABLES"]
-                )
-            if self._client_options._use_lineage_processes:
-                table_description_prompt = (
-                    table_description_prompt
-                    + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_LINEAGE_PROCESSES"]
-                )
-            if self._client_options._use_ext_documents:
-                table_description_prompt = (
-                    table_description_prompt
-                    + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_DOCUMENT"]
-                )
+            prompt += constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_BASE"]
+
+            # Dynamic prompt construction based on context
+            if self._context:
+                if self._client_options._use_profile and self._context.get("has_profile"):
+                    prompt += constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_PROFILE"]
+                
+                if self._client_options._use_data_quality and self._context.get("has_data_quality"):
+                    prompt += constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_QUALITY"]
+                    if self._context.get("has_quality_issues"):
+                        prompt += " The data quality report indicates potential issues. Please pay special attention to this when generating the description."
+
+                if self._client_options._use_lineage_tables and self._context.get("has_lineage"):
+                    prompt += constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_LINEAGE_TABLES"]
+                
+                if self._client_options._use_lineage_processes and self._context.get("has_lineage"):
+                    prompt += constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_LINEAGE_PROCESSES"]
+
+                if self._client_options._use_ext_documents and self._context.get("has_ext_docs"):
+                    prompt += constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_DOCUMENT"]
+
+                if self._context.get("column_count", 0) > 50:
+                    prompt += " This table has a large number of columns. Please provide a concise summary of the most important columns."
+
             # Generation base
-            table_description_prompt = (
-                table_description_prompt
-                + constants["PROMPTS"]["TABLE_DESCRIPTION_GENERATION_BASE"]
-            )
+            prompt += constants["PROMPTS"]["TABLE_DESCRIPTION_GENERATION_BASE"]
+            
             # Generation with additional information
-            if (
-                self._client_options._use_lineage_tables
-                or self._client_options._use_lineage_processes
-            ):
-                table_description_prompt = (
-                    table_description_prompt
-                    + constants["PROMPTS"]["TABLE_DESCRIPTION_GENERATION_LINEAGE"]
-                )
+            if self._context and self._context.get("has_lineage"):
+                prompt += constants["PROMPTS"]["TABLE_DESCRIPTION_GENERATION_LINEAGE"]
+
             # Output format
-            table_description_prompt = (
-                table_description_prompt + constants["PROMPTS"]["OUTPUT_FORMAT_PROMPT"]
-            )
-            return table_description_prompt
+            prompt += constants["PROMPTS"]["OUTPUT_FORMAT_PROMPT"]
+            return prompt
         except Exception as e:
             logger.error(f"Exception: {e}.")
             raise e
@@ -313,7 +300,7 @@ class Client:
         self._table_exists(table_fqn)
         # Get base information
         logger.info(f"Getting schema for table {table_fqn}.")
-        table_schema_str, _ = self._`get_table_`schema(table_fqn)
+        table_schema_str, _ = self._get_table_schema(table_fqn)
         logger.info(f"Getting sample for table {table_fqn}.")
         table_sample = self._get_table_sample(
             table_fqn, constants["DATA"]["NUM_ROWS_TO_SAMPLE"]
@@ -335,8 +322,19 @@ class Client:
         job_sources_info = self._get_job_sources(
             self._client_options._use_lineage_processes, table_fqn
         )
+
+        # Intelligent context building
+        context = {
+            "has_profile": bool(table_profile),
+            "has_data_quality": bool(table_quality),
+            "has_quality_issues": "failed" in str(table_quality).lower(),
+            "has_lineage": bool(table_sources_info or job_sources_info),
+            "has_ext_docs": bool(documentation_uri),
+            "column_count": len(table_schema_str.split(","))
+        }
+
         prompt_manager = PromptManager(
-            PromtType.PROMPT_TYPE_TABLE, self._client_options
+            PromtType.PROMPT_TYPE_TABLE, self._client_options, context
         )
 
         if documentation_uri == "":
@@ -1015,6 +1013,29 @@ class Client:
             _ = self._cloud_clients[constants["CLIENTS"]["BIGQUERY"]].update_table(
                 table, ["schema"]
             )
+        except Exception as e:
+            logger.error(f"Exception: {e}.")
+            raise e
+
+    def generate_dbt_model_description(self, dbt_project_path: str, model_name: str):
+        """Generates metadata for a dbt model.
+
+        Args:
+            dbt_project_path: The path to the dbt project.
+            model_name: The name of the dbt model.
+        """
+        logger.info(f"Generating metadata for dbt model {model_name}.")
+        try:
+            dbt_reader = DBTReader(dbt_project_path)
+            model = dbt_reader.get_model(model_name)
+            table_fqn = f"{model['database']}.{model['schema']}.{model['alias']}"
+
+            logger.info(f"dbt model corresponds to BigQuery table: {table_fqn}")
+
+            # Reuse existing methods
+            self.generate_table_description(table_fqn)
+            self.generate_columns_descriptions(table_fqn)
+
         except Exception as e:
             logger.error(f"Exception: {e}.")
             raise e

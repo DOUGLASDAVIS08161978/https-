@@ -53,6 +53,10 @@ class DatasetSettings(BaseModel):
     documentation_csv_uri: str
     strategy: str
 
+class DbtSettings(BaseModel):
+    dbt_project_path: str
+    model_name: str
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -62,6 +66,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.post("/generate_dbt_model_description")
+def generate_dbt_model_description(
+    client_options_settings: ClientOptionsSettings = Body(),
+    client_settings: ClientSettings = Body(),
+    dbt_settings: DbtSettings = Body(),
+):
+    """
+    Generates a dbt model description in Dataplex using the provided settings.
+    """
+    try:
+        client_options = ClientOptions(
+            client_options_settings.use_lineage_tables,
+            client_options_settings.use_lineage_processes,
+            client_options_settings.use_profile,
+            client_options_settings.use_data_quality,
+            client_options_settings.use_ext_documents,
+        )
+        client = Client(
+            project_id=client_settings.project_id,
+            llm_location=client_settings.llm_location,
+            dataplex_location=client_settings.dataplex_location,
+            client_options=client_options,
+        )
+        result = client.generate_dbt_model_description(
+            dbt_project_path=dbt_settings.dbt_project_path,
+            model_name=dbt_settings.model_name,
+        )
+        return {"message": result}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
 
 
 @app.get("/version")
